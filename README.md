@@ -8,7 +8,7 @@ AgentHire AI is a web application for creating structured interviews, submitting
 
 ## Screenshots
 
-No sanitized screenshots of the running application are currently included. Screenshots are intentionally omitted rather than presenting fabricated or private-user captures as genuine. To complete this section, capture the actual UI using a test account and redact user data:
+![AgentHire AI landing page](./docs/assets/agenthire-home.png)
 
 - Sign-in / landing screen
 - Interview workspace with generated questions
@@ -50,98 +50,129 @@ The embedding model runs in the backend process; it is not an OpenRouter-hosted 
 
 ```mermaid
 flowchart LR
-    Browser["React + Vite browser app"]
-    API["FastAPI / Uvicorn"]
-    Auth["Supabase Auth JWKS\nES256 token validation"]
-    Access["Profile, active-access,\nrole and ownership checks"]
-    Graph["LangGraph interview /\nevaluation workflows"]
-    RAG["Document extraction,\nchunking and retrieval"]
-    Embed["Sentence Transformers\nall-MiniLM-L6-v2 (384 dims)"]
-    DB["Supabase PostgreSQL\nSQLAlchemy + pgvector"]
-    LLM["OpenRouter chat completions"]
+    subgraph Client[Client layer]
+        Browser[React + Vite frontend]
+    end
 
-    Browser -->|"Bearer access token + API request"| API
+    subgraph App[Application layer]
+        API[FastAPI API]
+        Auth[Supabase Auth JWKS validation]
+        Access[Access + role + ownership checks]
+        Interview[LangGraph interview workflow]
+        RAG[Document ingestion + retrieval pipeline]
+        Embed[SentenceTransformers embeddings]
+    end
+
+    subgraph Data[Persistence layer]
+        DB[(Supabase PostgreSQL + pgvector)]
+    end
+
+    LLM[OpenRouter LLM]
+
+    Browser -->|JWT + REST requests| API
     API --> Auth
+    Auth -->|validated claims| API
     API --> Access
     Access --> DB
-    API --> Graph
-    Graph --> LLM
+    API --> Interview
+    Interview --> LLM
     API --> RAG
     RAG --> Embed
     RAG --> DB
     RAG --> LLM
+    DB -->|user, interview, document state| API
 ```
 
-Supabase Auth issues the user's token. The API verifies it, loads the profile and checks current access/role where required. Interview and document records are persisted in PostgreSQL; LLM completions are requested from OpenRouter. RAG embeddings are generated locally in the backend using Sentence Transformers.
+The frontend authenticates with Supabase and sends JWT-backed requests to the FastAPI API. The backend validates tokens, checks active access and role, persists interview and document state in PostgreSQL, and calls LangGraph or retrieval services when needed. Embeddings are generated locally in the backend with Sentence Transformers, while LLM-generated interview questions, evaluations, and grounded answers come from OpenRouter.
 
 ## Request and data flows
 
-### Authentication and access
+### 1) Authentication and access flow
 
 ```mermaid
 sequenceDiagram
     participant UI as React client
     participant Auth as Supabase Auth
-    participant API as FastAPI
+    participant API as FastAPI backend
     participant DB as PostgreSQL
-    UI->>Auth: Sign in
-    Auth-->>UI: Session and access token
-    UI->>API: Request with Bearer token
-    API->>Auth: Resolve signing key from JWKS and validate claims
-    API->>DB: Load user_profiles row
-    DB-->>API: Role and is_active
-    API-->>UI: Response or 401/403
+
+    UI->>Auth: Sign in / obtain JWT
+    Auth-->>UI: Access token + session metadata
+    UI->>API: API request with Authorization header
+    API->>Auth: Fetch JWKS and validate JWT signature + claims
+    API->>DB: Load user profile and access status
+    DB-->>API: role, is_active, ownership metadata
+    API-->>UI: 200 OK or 401 / 403 response
 ```
 
-`GET /api/v1/auth/me` returns the profile role and current `is_active` state for an authenticated user. Protected application routes require active access; administrative routes additionally require `role=admin`. Session, question, and document lookups include ownership checks in the API. This describes application-level enforcement; it is not a claim that database Row Level Security (RLS) policies were audited.
+`GET /api/v1/auth/me` returns the current role and `is_active` state for the signed-in user. Protected routes require an active account, and admin routes require `role=admin`. Ownership checks are enforced in the API layer for sessions, questions, and documents.
 
-### Interview workflow
+### 2) Interview generation and evaluation flow
 
-1. An active user submits a job description and requested question count (1–5).
-2. The interview service requests question generation through OpenRouter.
-3. The API saves the session and its generated question records in PostgreSQL, then returns their persisted UUIDs.
-4. The client submits an answer using both the session UUID and question UUID.
-5. The API checks ownership, runs answer evaluation, and stores the answer and evaluation.
-6. The report endpoint aggregates the persisted questions, answers, and evaluations for that owned session.
+```mermaid
+flowchart TD
+    A[User submits job description + question count] --> B[FastAPI validates access]
+    B --> C[Interview service calls LangGraph workflow]
+    C --> D[OpenRouter generates interview questions]
+    D --> E[API stores session + questions in PostgreSQL]
+    E --> F[Client answers each question]
+    F --> G[FastAPI checks ownership and evaluates answer]
+    G --> H[Store answer + evaluation + report data]
+    H --> I[Report endpoint returns aggregated interview results]
+```
 
-### RAG workflow
+This process creates a user-owned interview session, persists generated question IDs, receives submitted answers, evaluates each answer, and consolidates the final report from the stored records.
 
-An active user uploads a PDF or TXT file (maximum 5 MiB). The API extracts readable text, divides it into overlapping character chunks (default 1,000 characters with 150-character overlap), encodes chunks as 384-dimensional vectors, and stores document metadata, chunks, and vectors. Search embeds the query and orders matching owned chunks by cosine distance. Grounded question answering passes retrieved chunk context to OpenRouter and returns source metadata. Scanned PDFs without extractable text require OCR, which is not included in this implementation.
+### 3) RAG document ingestion and grounded answer flow
 
+```mermaid
+flowchart TD
+    A[User uploads PDF or TXT document] --> B[FastAPI validates access and file type]
+    B --> C[Extract readable text + chunk text]
+    C --> D[Generate embeddings with SentenceTransformers]
+    D --> E[Store document metadata + chunks + vectors in PostgreSQL pgvector]
+    E --> F[User asks a question about uploaded documents]
+    F --> G[Embed query + semantic retrieval over owned chunks]
+    G --> H[Retrieve relevant context]
+    H --> I[OpenRouter answers using retrieved context]
+    I --> J[Return grounded answer with source metadata + citations]
+```
+
+PDF and TXT uploads are processed in the backend, chunked, embedded, and stored for semantic search. Grounded answers combine the user's question with the most relevant retrieved document chunks to produce cited responses with source context.
 ## Repository layout
 
 ```text
 .
-├── app/
-│   ├── admin_bootstrap.py       # Trusted, explicit initial-admin bootstrap
-│   ├── admin_routes.py          # Admin user access API
-│   ├── auth.py                  # JWT, active-user, and admin dependencies
-│   ├── database.py              # SQLAlchemy engine and session dependency
-│   ├── document_service.py      # PDF/TXT extraction and chunking
-│   ├── embedding_service.py     # Cached Sentence Transformer model
-│   ├── interview_graph.py       # LangGraph question/evaluation workflows
-│   ├── interview_service.py     # Interview question generation
-│   ├── llm_service.py           # OpenRouter client
-│   ├── main.py                  # FastAPI routes and schemas
-│   ├── models.py                # SQLAlchemy models
-│   ├── ownership.py             # Owner-scoped record lookup helpers
-│   ├── rag_qa_service.py        # Retrieval-grounded answers
-│   ├── rag_service.py           # Document indexing
-│   ├── retrieval_service.py     # pgvector semantic search
-│   └── test_*.py                # Backend unit/API tests
-├── frontend/
-│   ├── src/                     # React app, admin UI, API client and styles
-│   ├── public/                  # Static public assets
-│   ├── package.json             # Frontend scripts and dependencies
-│   └── vercel.json              # SPA rewrite for Vercel hosting
-├── migrations/
-│   ├── env.py                   # Alembic configuration
-│   └── versions/                # Ownership and access migrations
-├── Dockerfile                   # Backend API image
-├── docker-compose.yml           # Local backend container
-├── render.yaml                  # Render Blueprint (not deployed)
-├── requirements.txt             # Backend dependencies
-└── README.md
+â”œâ”€â”€ app/
+â”‚   â”œâ”€â”€ admin_bootstrap.py       # Trusted, explicit initial-admin bootstrap
+â”‚   â”œâ”€â”€ admin_routes.py          # Admin user access API
+â”‚   â”œâ”€â”€ auth.py                  # JWT, active-user, and admin dependencies
+â”‚   â”œâ”€â”€ database.py              # SQLAlchemy engine and session dependency
+â”‚   â”œâ”€â”€ document_service.py      # PDF/TXT extraction and chunking
+â”‚   â”œâ”€â”€ embedding_service.py     # Cached Sentence Transformer model
+â”‚   â”œâ”€â”€ interview_graph.py       # LangGraph question/evaluation workflows
+â”‚   â”œâ”€â”€ interview_service.py     # Interview question generation
+â”‚   â”œâ”€â”€ llm_service.py           # OpenRouter client
+â”‚   â”œâ”€â”€ main.py                  # FastAPI routes and schemas
+â”‚   â”œâ”€â”€ models.py                # SQLAlchemy models
+â”‚   â”œâ”€â”€ ownership.py             # Owner-scoped record lookup helpers
+â”‚   â”œâ”€â”€ rag_qa_service.py        # Retrieval-grounded answers
+â”‚   â”œâ”€â”€ rag_service.py           # Document indexing
+â”‚   â”œâ”€â”€ retrieval_service.py     # pgvector semantic search
+â”‚   â””â”€â”€ test_*.py                # Backend unit/API tests
+â”œâ”€â”€ frontend/
+â”‚   â”œâ”€â”€ src/                     # React app, admin UI, API client and styles
+â”‚   â”œâ”€â”€ public/                  # Static public assets
+â”‚   â”œâ”€â”€ package.json             # Frontend scripts and dependencies
+â”‚   â””â”€â”€ vercel.json              # SPA rewrite for Vercel hosting
+â”œâ”€â”€ migrations/
+â”‚   â”œâ”€â”€ env.py                   # Alembic configuration
+â”‚   â””â”€â”€ versions/                # Ownership and access migrations
+â”œâ”€â”€ Dockerfile                   # Backend API image
+â”œâ”€â”€ docker-compose.yml           # Local backend container
+â”œâ”€â”€ render.yaml                  # Render Blueprint (not deployed)
+â”œâ”€â”€ requirements.txt             # Backend dependencies
+â””â”€â”€ README.md
 ```
 
 Generated folders, virtual environments, local `.env` files, and frontend dependencies are omitted.
@@ -238,7 +269,7 @@ All protected routes require `Authorization: Bearer <Supabase access token>`. Ap
 | `POST` | `/api/v1/interview/question` | Active user | Generate one interview question |
 | `POST` | `/api/v1/interview/evaluate` | Active user | Evaluate a submitted answer |
 | `POST` | `/api/v1/interview/run` | Active user | Run the combined question/answer workflow |
-| `POST` | `/api/v1/interview/session` | Active user | Create a persisted interview session with 1–5 questions |
+| `POST` | `/api/v1/interview/session` | Active user | Create a persisted interview session with 1â€“5 questions |
 | `POST` | `/api/v1/interview/sessions/{session_id}/questions/{question_id}/answer` | Active owner | Persist answer and evaluation for an owned question |
 | `GET` | `/api/v1/interview/sessions/{session_id}/report` | Active owner | Retrieve report for an owned session |
 | `POST` | `/api/v1/documents/upload` | Active user | Upload and index a PDF or TXT file (up to 5 MiB) |
@@ -293,7 +324,7 @@ This repository's Docker image runs the **FastAPI backend only**. It relies on t
 
 The local image tag is `agenthire-api:local`. The backend listens on container port 8000 and Compose exposes it at host port 8001. The image runs as a non-root user and has a `/health` Docker health check. `.dockerignore` excludes environment files, Git data, frontend dependencies, local virtual environments, and test artifacts.
 
-Secrets are supplied to the running container from the local root `.env` through Compose interpolation; they are not Docker build arguments, copied files, or image layers. Do not use `ARG` or `ENV` in the Dockerfile for secret values, and do not publish an image built from an accidentally secret-bearing context. If the trusted admin bootstrap is intentionally needed in a container, use a separate one-shot invocation with the secret environment supplied at runtime—never as part of normal service startup.
+Secrets are supplied to the running container from the local root `.env` through Compose interpolation; they are not Docker build arguments, copied files, or image layers. Do not use `ARG` or `ENV` in the Dockerfile for secret values, and do not publish an image built from an accidentally secret-bearing context. If the trusted admin bootstrap is intentionally needed in a container, use a separate one-shot invocation with the secret environment supplied at runtimeâ€”never as part of normal service startup.
 
 The Docker image has not been built or smoke-tested in this environment yet; Docker Desktop's daemon was unavailable during checks.
 
