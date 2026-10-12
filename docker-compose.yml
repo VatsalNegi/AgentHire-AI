@@ -1,0 +1,16 @@
+services:
+  api:
+    image: agenthire-api:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      FRONTEND_ORIGINS: ${FRONTEND_ORIGINS:-http://localhost:5173}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in the root .env file}
+      SUPABASE_URL: ${SUPABASE_URL:?Set SUPABASE_URL in the root .env file}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?Set OPENROUTER_API_KEY in the root .env file}
